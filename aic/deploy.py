@@ -14,7 +14,7 @@ from ai_api_client_sdk.models.parameter_binding import ParameterBinding
 from ai_core_sdk.models import TargetStatus
 
 from aic import ui
-from aic.client import create_client, get_resource_group
+from aic.client import create_client, get_resource_group, templates_dir, save_templates_dir
 from aic import s3 as s3ops
 from aic import docker
 
@@ -82,8 +82,16 @@ def pick_input_mode() -> dict:
             sys.exit(1)
         return load_config(path)
 
-    # Mode 1: pick from app/ templates
-    app_dir = Path("app")
+    # Mode 1: pick from configured templates directory
+    app_dir = templates_dir()
+    if not app_dir.is_dir():
+        print()
+        ui.warning(f"Templates directory not found: {app_dir}")
+        raw = ui.prompt("Enter path to ServingTemplate directory")
+        app_dir = Path(raw).expanduser().resolve()
+        if app_dir.is_dir():
+            save_templates_dir(app_dir)
+            ui.success(f"Saved: will use {app_dir} for future deploys")
     templates = sorted(app_dir.glob("*.yaml")) if app_dir.is_dir() else []
     if not templates:
         ui.error("No YAML files found in app/")
@@ -109,8 +117,9 @@ def pick_input_mode() -> dict:
 # Main deploy flow
 # ============================================================================
 
-def run(auto: bool = False, config_path: str = None, scenario_id: str = None):
-    """Run the 6-step deploy pipeline."""
+def run(config_path: str = None, scenario_id: str = None):
+    """Run the deploy pipeline."""
+    auto = bool(config_path)
     if auto:
         if not config_path or not os.path.exists(config_path):
             ui.error("--auto requires --config <path> pointing to an existing deployment_config.yaml")
@@ -604,10 +613,14 @@ def step_configuration(client, general: dict, params: dict, artifact_id: str, au
         params["modelVersion"] = model_folder
 
     if not auto:
-        # Let user review/edit all params loaded from the template or config
+        # Let user review/edit all params loaded from the template or config.
+        # containerImage was already resolved in Step 2 — skip it here.
         ui.dim("  Review deployment parameters (press Enter to keep default):")
         print()
         for key in list(params.keys()):
+            if key == "containerImage":
+                ui.dim(f"  {key}: {params[key]}  (set in Step 2)")
+                continue
             new_val = ui.prompt(f"  {key}", default=params[key])
             params[key] = new_val
 
@@ -724,6 +737,8 @@ def _save_config_yaml(path, general, params, artifact_id, model_cfg, docker_cfg,
     lines.append("")
     lines.append("parameter_bindings:")
     for key, value in params.items():
+        if key == "containerImage":
+            continue  # stored in docker.image — no need to duplicate
         lines.append(f'  - key: "{key}"')
         lines.append(f'    value: "{value}"')
     lines.append("")
@@ -742,9 +757,41 @@ def _save_config_yaml(path, general, params, artifact_id, model_cfg, docker_cfg,
 
 
 def monitor(client, deployment_id: str):
-    """Poll deployment status until RUNNING or failed."""
-    ui.dim("  Monitoring... (Ctrl+C to stop, deployment continues in background)")
+    """Poll deployment status until RUNNING or failed.
+    Prints detailed status to CLI each cycle and streams logs to a file."""
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_file = logs_dir / f"{deployment_id}_{timestamp}.log"
+
+    # Create the file immediately so it can be opened/tailed while deployment is pending
+    log_file.touch()
+
+    ui.dim(f"  Monitoring... (Ctrl+C to stop, deployment continues in background)")
+    ui.dim(f"  Logs → {log_file}")
+    print()
+
     start = time.time()
+    seen_log_lines: set[str] = set()
+    last_status = None
+    _log_fh = open(log_file, "a", buffering=1)  # line-buffered — every write hits disk immediately
+
+    def _fetch_logs() -> list[str]:
+        try:
+            response = client.deployment.query_logs(deployment_id=deployment_id)
+            if response.data and response.data.result:
+                return [item.msg for item in reversed(response.data.result)]
+        except Exception:
+            pass
+        return []
+
+    def _append_new_logs(lines: list[str]):
+        new_lines = [l for l in lines if l not in seen_log_lines]
+        if new_lines:
+            seen_log_lines.update(new_lines)
+            for line in new_lines:
+                _log_fh.write(line + "\n")
+        return new_lines
 
     try:
         while True:
@@ -753,12 +800,33 @@ def monitor(client, deployment_id: str):
             elapsed = int(time.time() - start)
             mins, secs = elapsed // 60, elapsed % 60
 
-            sys.stdout.write(f"\r  Status: {status}  |  Elapsed: {mins}m {secs}s   ")
-            sys.stdout.flush()
+            # Print status block on every change (or every cycle if details present)
+            details = dep.status_details or {}
+            reason = details.get("reason", "") if isinstance(details, dict) else ""
+            message = details.get("message", "") if isinstance(details, dict) else ""
+
+            if status != last_status or reason:
+                print(f"  [{mins:02d}m{secs:02d}s]  Status: {status}", end="")
+                if reason:
+                    print(f"  |  {reason}", end="")
+                if message:
+                    print(f"\n           {message}", end="")
+                print()
+                last_status = status
+            else:
+                sys.stdout.write(f"\r  [{mins:02d}m{secs:02d}s]  Status: {status}   ")
+                sys.stdout.flush()
+
+            # Fetch and write new log lines to file
+            all_logs = _fetch_logs()
+            new_lines = _append_new_logs(all_logs)
+            if new_lines:
+                sys.stdout.write("\r")
+                ui.dim(f"  → {len(new_lines)} new log line(s) written to {log_file}")
 
             if status == "RUNNING":
                 print()
-                ui.success(f"Deployment is RUNNING")
+                ui.success(f"Deployment is RUNNING  ({mins}m {secs}s)")
                 if dep.deployment_url:
                     ui.success(f"URL: {dep.deployment_url}")
                 return
@@ -766,15 +834,21 @@ def monitor(client, deployment_id: str):
             if status in ("DEAD", "STOPPED"):
                 print()
                 ui.error(f"Deployment ended with status: {status}")
-                if dep.status_details:
-                    ui.dim(f"  Details: {json.dumps(dep.status_details, indent=2)}")
+                if message:
+                    ui.dim(f"  {message}")
+                ui.dim(f"  Full logs: {log_file}")
                 return
 
             time.sleep(30)
 
     except KeyboardInterrupt:
         print()
-        ui.dim(f"  Stopped monitoring. Check status: aic deploy --status {deployment_id}")
+        ui.dim(f"  Stopped monitoring. Deployment continues in background.")
+        ui.dim(f"  Logs so far: {log_file}")
+        ui.dim(f"  Check status: aic deploy --status {deployment_id}")
+        ui.dim(f"  Stream logs:  aic deploy --logs {deployment_id}")
+    finally:
+        _log_fh.close()
 
 
 # ============================================================================

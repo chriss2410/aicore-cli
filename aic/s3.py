@@ -13,23 +13,89 @@ DEFAULT_PREFIX = ""
 
 
 def load_credentials(json_key_path: str) -> dict:
-    """Load S3 credentials from a JSON key file."""
+    """Load and normalize S3/object-store credentials from a JSON key file.
+
+    Supported shapes:
+      BTP Object Store  — access_key_id, secret_access_key, bucket, host, region
+      Standard AWS      — aws_access_key_id, aws_secret_access_key, (bucket optional)
+      GCP GCS           — type=service_account + bucket  (requires google-cloud-storage)
+      Azure Blob        — account_name + account_key + container  (requires azure-storage-blob)
+    """
     with open(json_key_path) as f:
-        creds = json.load(f)
+        raw = json.load(f)
+
+    # Standard AWS credentials format
+    if "aws_access_key_id" in raw:
+        return {
+            "access_key_id": raw["aws_access_key_id"],
+            "secret_access_key": raw["aws_secret_access_key"],
+            "bucket": raw.get("bucket", raw.get("s3_bucket", "")),
+            "region": raw.get("region", raw.get("aws_default_region", "us-east-1")),
+            "host": raw.get("endpoint_url", raw.get("host", "")),
+            "_provider": "aws",
+        }
+
+    # GCP GCS (service account key)
+    if raw.get("type") == "service_account" and "project_id" in raw:
+        return {
+            "_provider": "gcs",
+            "_raw": raw,
+            "bucket": raw.get("bucket", ""),
+            "project": raw.get("project_id", ""),
+        }
+
+    # Azure Blob Storage
+    if "account_name" in raw and ("account_key" in raw or "connection_string" in raw):
+        return {
+            "_provider": "azure",
+            "_raw": raw,
+            "bucket": raw.get("container", raw.get("bucket", "")),
+            "account_name": raw["account_name"],
+            "account_key": raw.get("account_key", ""),
+            "connection_string": raw.get("connection_string", ""),
+        }
+
+    # BTP Object Store (default)
     for key in ("access_key_id", "secret_access_key", "bucket"):
-        if key not in creds:
-            raise ValueError(f"Missing key in S3 credentials: {key}")
-    return creds
+        if key not in raw:
+            raise ValueError(f"Missing key in S3 credentials: '{key}'. "
+                             f"Expected BTP, standard AWS (aws_access_key_id), "
+                             f"GCP service account, or Azure (account_name) format.")
+    return {**raw, "_provider": "s3"}
 
 
 def create_client(creds: dict):
-    """Create a boto3 S3 client from credentials dict."""
-    endpoint_url = f"https://{creds['host']}" if "host" in creds else None
+    """Create a storage client from normalized credentials."""
+    provider = creds.get("_provider", "s3")
+
+    if provider == "gcs":
+        try:
+            from google.cloud import storage as gcs
+            from google.oauth2 import service_account
+        except ImportError:
+            raise ImportError("GCP support requires: pip install google-cloud-storage")
+        sa_creds = service_account.Credentials.from_service_account_info(creds["_raw"])
+        return gcs.Client(project=creds["project"], credentials=sa_creds)
+
+    if provider == "azure":
+        try:
+            from azure.storage.blob import BlobServiceClient
+        except ImportError:
+            raise ImportError("Azure support requires: pip install azure-storage-blob")
+        if creds.get("connection_string"):
+            return BlobServiceClient.from_connection_string(creds["connection_string"])
+        return BlobServiceClient(
+            account_url=f"https://{creds['account_name']}.blob.core.windows.net",
+            credential=creds["account_key"],
+        )
+
+    # AWS / BTP S3 (boto3)
+    endpoint_url = f"https://{creds['host']}" if creds.get("host") else None
     return boto3.client(
         "s3",
         aws_access_key_id=creds["access_key_id"],
         aws_secret_access_key=creds["secret_access_key"],
-        region_name=creds.get("region", "eu-central-1"),
+        region_name=creds.get("region", "us-east-1"),
         endpoint_url=endpoint_url,
     )
 

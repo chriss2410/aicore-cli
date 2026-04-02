@@ -82,11 +82,10 @@ For a deeper introduction, see the [SAP AI Core documentation](https://help.sap.
 ```bash
 # One-time infrastructure setup
 aic setup
-aic setup --auto
 
 # Deploy a model
-aic deploy                                        # interactive
-aic deploy --auto --config deployment_config.yaml
+aic deploy                                   # interactive — picks template from app/
+aic deploy --config deployment_config.yaml   # non-interactive — no prompts
 
 # Manage deployments
 aic deploy --list

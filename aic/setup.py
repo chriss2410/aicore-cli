@@ -9,6 +9,8 @@ from aic.client import (
     create_client,
     get_resource_group,
     save_secrets_dir,
+    save_templates_dir,
+    templates_dir,
     DEFAULT_AIC_KEY,
     DEFAULT_DOCKER_KEY,
     DEFAULT_S3_KEY,
@@ -19,34 +21,83 @@ from aic.client import (
 from aic.s3 import load_credentials
 
 
-def _configure_credentials(auto: bool) -> Path:
-    """Pre-step: locate AI Core key and persist its directory to ~/.aic/config."""
-    ui.header("Credentials")
-    default = str(DEFAULT_AIC_KEY())
-    if auto:
-        key_path = Path(default)
-    else:
-        ui.dim(f"  Current credentials directory: {secrets_dir()}")
-        raw = ui.prompt("Path to AI Core service key JSON", default=default)
-        key_path = Path(raw).expanduser().resolve()
+def _scan_secrets(directory: Path) -> dict[str, Path]:
+    """Scan a directory and classify JSON files by their structure."""
+    found = {}
+    for f in sorted(directory.glob("*.json")):
+        try:
+            data = json.loads(f.read_text())
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            if "serviceurls" in data and "AI_API_URL" in data.get("serviceurls", {}):
+                found.setdefault("aic", f)
+            elif ".dockerconfigjson" in data:
+                found.setdefault("docker", f)
+            elif "application_name" in data and "repository_url" in data:
+                found.setdefault("argocd", f)
+            elif "url" in data and "username" in data and "password" in data and "name" in data:
+                found.setdefault("github", f)
+            elif any(k in data for k in ("access_key_id", "aws_access_key_id")):
+                found.setdefault("s3", f)
+            elif data.get("type") == "service_account" and "project_id" in data:
+                found.setdefault("s3", f)  # GCP service account
+            elif "account_name" in data and ("account_key" in data or "connection_string" in data):
+                found.setdefault("s3", f)  # Azure Blob
+    return found
 
-    save_secrets_dir(key_path.parent)
-    ui.success(f"Credentials directory set to: {key_path.parent}")
+
+def _configure_credentials() -> Path:
+    """Pre-step: locate credentials directory, auto-detect key files, persist config."""
+    ui.header("Credentials")
+    ui.dim(f"  Current credentials directory: {secrets_dir()}")
+    raw = ui.prompt("Path to credentials directory (or directly to aic-key.json)",
+                    default=str(secrets_dir()))
+    given = Path(raw).expanduser().resolve()
+
+    # If user gave a file path, use its parent as the dir
+    if given.is_file():
+        key_path = given
+        creds_dir = given.parent
+    else:
+        creds_dir = given
+        # Scan for key files
+        detected = _scan_secrets(creds_dir)
+        if detected:
+            print()
+            ui.dim("  Auto-detected credential files:")
+            labels = {"aic": "AI Core key", "s3": "Object store key", "docker": "Docker secret",
+                      "github": "GitHub repo", "argocd": "ArgoCD app"}
+            for kind, path in detected.items():
+                ui.dim(f"    {labels.get(kind, kind):20s} → {path.name}")
+        key_path = detected.get("aic") or creds_dir / "aic-key.json"
+
+    save_secrets_dir(creds_dir)
+    ui.success(f"Credentials directory set to: {creds_dir}")
+
+    # Templates directory
+    print()
+    current_tmpl = templates_dir()
+    tmpl_raw = ui.prompt("Path to ServingTemplate directory (app/*.yaml)",
+                         default=str(current_tmpl))
+    save_templates_dir(Path(tmpl_raw))
+    ui.success(f"Templates directory set to: {tmpl_raw}")
+
     return key_path
 
 
-def run(auto: bool = False):
+def run():
     """Run the 4-step setup flow."""
-    aic_key_path = _configure_credentials(auto)
+    aic_key_path = _configure_credentials()
     client = create_client(aic_key_path=aic_key_path)
     rg = get_resource_group()
 
     ui.banner("aic setup", f"One-time AI Core infrastructure setup (resource group: {rg})")
 
-    step_docker_secret(client, auto)
-    step_github_repo(client, auto)
-    step_argocd_app(client, auto)
-    step_object_store(client, rg, auto)
+    step_docker_secret(client)
+    step_github_repo(client)
+    step_argocd_app(client)
+    step_object_store(client, rg)
 
     print()
     ui.success("All prerequisites ready.")
@@ -56,7 +107,7 @@ def run(auto: bool = False):
 # Step 1: Docker Registry Secret
 # ---------------------------------------------------------------------------
 
-def step_docker_secret(client, auto: bool):
+def step_docker_secret(client):
     ui.header("Step 1/4 — Docker Registry Secret")
 
     try:
@@ -73,14 +124,8 @@ def step_docker_secret(client, auto: bool):
             [[str(i), s.name] for i, s in enumerate(existing, 1)],
         )
         ui.success(f"{len(existing)} docker secret(s) found")
-        if auto:
-            return
         if not ui.confirm("Register another docker secret?", default=False):
             return
-
-    if auto:
-        ui.warning("No docker secrets found — skipping in auto mode")
-        return
 
     _create_docker_secret(client)
 
@@ -131,7 +176,7 @@ def _create_docker_secret(client):
 # Step 2: GitHub Repository
 # ---------------------------------------------------------------------------
 
-def step_github_repo(client, auto: bool):
+def step_github_repo(client):
     ui.header("Step 2/4 — GitHub Repository (your templates repo)")
 
     try:
@@ -152,14 +197,8 @@ def step_github_repo(client, auto: bool):
             rows,
         )
         ui.success(f"{len(existing)} repository(s) found")
-        if auto:
-            return
         if not ui.confirm("Register another repository?", default=False):
             return
-
-    if auto:
-        ui.warning("No repositories found — skipping in auto mode")
-        return
 
     _create_github_repo(client)
 
@@ -213,7 +252,7 @@ def _create_github_repo(client):
 # Step 3: ArgoCD Application
 # ---------------------------------------------------------------------------
 
-def step_argocd_app(client, auto: bool):
+def step_argocd_app(client):
     ui.header("Step 3/4 — ArgoCD Application (syncs YAML to AI Core)")
 
     try:
@@ -238,14 +277,8 @@ def step_argocd_app(client, auto: bool):
             rows,
         )
         ui.success(f"{len(existing)} application(s) found")
-        if auto:
-            return
         if not ui.confirm("Create another application?", default=False):
             return
-
-    if auto:
-        ui.warning("No applications found — skipping in auto mode")
-        return
 
     _create_argocd_app(client)
 
@@ -303,7 +336,7 @@ def _create_argocd_app(client):
 # Step 4: Object Store (S3)
 # ---------------------------------------------------------------------------
 
-def step_object_store(client, resource_group: str, auto: bool):
+def step_object_store(client, resource_group: str):
     ui.header("Step 4/4 — Object Store (S3)")
 
     try:
@@ -323,14 +356,8 @@ def step_object_store(client, resource_group: str, auto: bool):
             rows,
         )
         ui.success(f"{len(existing)} object store(s) found")
-        if auto:
-            return
         if not ui.confirm("Register another object store?", default=False):
             return
-
-    if auto:
-        ui.warning("No object stores found — skipping in auto mode")
-        return
 
     _create_object_store(client, resource_group)
 
